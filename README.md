@@ -21,7 +21,17 @@ python3 app.py --db organ_allocation.db
 - `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报。
 - `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认。
 - `POST /api/allocations/{id}/implant`：确认植入。
+- `POST /api/allocations/{id}/events`：三方（来源医院、接收医院、调配员）提交转运事件，可带 `submitted_at` 表示提交时刻，系统接成单条分配时间线做对账。
+- `GET /api/allocations/{id}/timeline`：查看对账时间线，医院只能看本机构相关的分配。
 - `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图。
+
+## 转运时间线对账规则
+
+- 每条事件记录提交人、角色和机构（`actor`/`role`/`hospital`），以及提交时刻 `submitted_at` 和入库时刻 `recorded_at`。
+- 同一动作晚到或重复提交只保留首次记录（返回 `duplicate`），晚到的中间步骤只补录一次，不把已完成步骤退回。
+- 完成类记录（转运、交接、植入）与撤回矛盾时，按 `submitted_at` 取最后生效的一步，被压掉的记录标记 `conflict`；提交时刻相同则先入库的保持生效。
+- 已过期分配不再接受任何事件生效，新事件一律记为 `conflict`。
+- 历史分配没有时间线时，首次读取或提交事件会按现有状态补一条 `system` 初始记录。
 
 ## 测试
 
