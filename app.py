@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +17,36 @@ from urllib.parse import urlparse
 PORT = 8203
 ROLES = {"viewer", "hospital", "coordinator", "allocation_officer", "auditor"}
 STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired"}
+
+# 三方（来源医院、接收医院、调配员）可提交的转运事件动作
+TIMELINE_ACTIONS = {
+    "allocation_proposed", "allocation_accepted", "transfer_started", "logistics_delay",
+    "handoff_initiated", "handoff_accepted", "organ_implanted", "allocation_withdrawn",
+}
+# 可重复提交的动作（如多次延误上报），其余动作按分配幂等去重
+REPEATABLE_ACTIONS = {"logistics_delay"}
+# 各推进步骤的阶段序号（单调递增，用于判断是否退回已完成步骤）
+STAGE_LEVEL = {
+    "allocation_proposed": 0,
+    "allocation_accepted": 1,
+    "transfer_started": 2,
+    "handoff_initiated": 2.5,
+    "handoff_accepted": 3,
+    "organ_implanted": 4,
+}
+# 终态完成动作（与撤回矛盾，按提交时刻取最后生效）
+TERMINAL_COMPLETION = {"handoff_accepted", "organ_implanted"}
+WITHDRAW_ACTION = "allocation_withdrawn"
+# 历史分配按现有状态补初始记录时的状态->动作映射
+STATUS_TO_ACTION = {
+    "proposed": "allocation_proposed",
+    "accepted": "allocation_accepted",
+    "in_transit": "transfer_started",
+    "handed_off": "handoff_accepted",
+    "implanted": "organ_implanted",
+    "withdrawn": "allocation_withdrawn",
+    "expired": "allocation_expired",
+}
 
 
 class ApiError(Exception):
@@ -73,6 +104,13 @@ class Repository:
             id INTEGER PRIMARY KEY AUTOINCREMENT, allocation_id INTEGER, donor_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL,
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS timeline_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, allocation_id INTEGER NOT NULL REFERENCES allocations(id),
+            action TEXT NOT NULL, actor TEXT NOT NULL, role TEXT NOT NULL, hospital TEXT NOT NULL DEFAULT '',
+            submitted_at TEXT NOT NULL, recorded_at TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}',
+            idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'effective', created_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_timeline_alloc ON timeline_events(allocation_id, submitted_at, id);
         """)
 
     @contextmanager
@@ -101,6 +139,137 @@ class OrganAllocationService:
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None: return dict(row) if row else None
+
+    def _record_event(self, conn: sqlite3.Connection, allocation_id: int, action: str, actor: str, role: str,
+                      hospital: str, detail: dict[str, Any] | None, submitted_at: str | None = None,
+                      event_id: str | None = None) -> dict[str, Any]:
+        """把三方提交的转运事件写入时间线。
+
+        同一个动作晚到或重复提交只补一次记录（幂等），不新增条目；
+        写入后立即按提交时刻对账，把矛盾的完成/撤回标记为冲突。
+        """
+        submitted = submitted_at or iso()
+        if event_id:
+            key = f"evt:{event_id}"
+        elif action in REPEATABLE_ACTIONS:
+            key = f"evt:{allocation_id}:{action}:{uuid.uuid4().hex}"
+        else:
+            key = f"evt:{allocation_id}:{action}"
+        if event_id or action not in REPEATABLE_ACTIONS:
+            existing = conn.execute("SELECT * FROM timeline_events WHERE idempotency_key=?", (key,)).fetchone()
+            if existing:
+                return dict(existing)
+        try:
+            cur = conn.execute("""INSERT INTO timeline_events(allocation_id,action,actor,role,hospital,submitted_at,recorded_at,detail_json,idempotency_key,status,created_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                               (allocation_id, action, actor, role, hospital or "", submitted, iso(),
+                                json.dumps(detail or {}, ensure_ascii=False, sort_keys=True), key, "effective", iso()))
+        except sqlite3.IntegrityError:
+            existing = conn.execute("SELECT * FROM timeline_events WHERE idempotency_key=?", (key,)).fetchone()
+            return dict(existing) if existing else None  # type: ignore[return-value]
+        self._reconcile(conn, allocation_id)
+        return dict(conn.execute("SELECT * FROM timeline_events WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def _reconcile(self, conn: sqlite3.Connection, allocation_id: int) -> None:
+        """按提交时刻对时间线对账，更新每条事件的生效/冲突状态。
+
+        规则：
+        - 推进步骤（接受、转运、交接、植入）按阶段单调生效，已完成步骤不退回；
+        - 矛盾的完成与撤回同时提交时，以提交时刻靠后的一步生效，被压掉的一步标 conflict；
+        - 已完成交接/植入后才提交的撤回属于晚到，标 conflict，不退回已完成步骤。
+        """
+        events = [dict(r) for r in conn.execute(
+            "SELECT * FROM timeline_events WHERE allocation_id=? ORDER BY submitted_at, id", (allocation_id,))]
+        if not events:
+            return
+        formal = conn.execute("SELECT status FROM allocations WHERE id=?", (allocation_id,)).fetchone()
+        completed = bool(formal) and formal["status"] in {"handed_off", "implanted"}
+        status: dict[int, str] = {e["id"]: "effective" for e in events}
+        cur_stage = -1
+        for e in events:
+            action = e["action"]
+            if action in REPEATABLE_ACTIONS or action == "allocation_expired":
+                status[e["id"]] = "effective"; continue
+            level = STAGE_LEVEL.get(action)
+            if action in TERMINAL_COMPLETION:
+                if level is not None and level > cur_stage:
+                    status[e["id"]] = "effective"; cur_stage = level
+                else:
+                    status[e["id"]] = "conflict"
+                continue
+            if action == WITHDRAW_ACTION:
+                if completed:
+                    status[e["id"]] = "conflict"  # 交接/植入已完成，撤回晚到，不退回
+                # 未完成时的胜负交给下方终态对账（按提交时刻最后生效）
+                continue
+            # 其余推进步骤
+            if level is not None and level > cur_stage:
+                status[e["id"]] = "effective"; cur_stage = level
+            else:
+                status[e["id"]] = "conflict"
+        # 终态对账：未完成时，完成与撤回按提交时刻取最后生效的一步
+        if not completed:
+            completions = [e for e in events if e["action"] in TERMINAL_COMPLETION]
+            withdraws = [e for e in events if e["action"] == WITHDRAW_ACTION]
+            if completions and withdraws:
+                latest_completion = max(completions, key=lambda e: (e["submitted_at"], e["id"]))
+                latest_withdraw = max(withdraws, key=lambda e: (e["submitted_at"], e["id"]))
+                if (latest_withdraw["submitted_at"], latest_withdraw["id"]) > (latest_completion["submitted_at"], latest_completion["id"]):
+                    for e in completions:
+                        status[e["id"]] = "conflict"
+                    for e in withdraws:
+                        status[e["id"]] = "effective" if e["id"] == latest_withdraw["id"] else "conflict"
+                else:
+                    for e in withdraws:
+                        status[e["id"]] = "conflict"
+        for eid, st in status.items():
+            conn.execute("UPDATE timeline_events SET status=? WHERE id=?", (st, eid))
+
+    def submit_event(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
+        """三方（来源医院、接收医院、调配员）提交转运事件，接入分配时间线对账。"""
+        if role not in {"hospital", "coordinator", "allocation_officer"}:
+            raise ApiError(403, "event_forbidden", "当前角色不能提交转运事件")
+        action = str(body.get("action", "")).strip()
+        if action not in TIMELINE_ACTIONS:
+            raise ApiError(400, "unknown_action", f"未知事件动作: {action}")
+        submitted_at = body.get("submitted_at")
+        if submitted_at:
+            submitted_at = iso(parse_time(submitted_at))
+        event_id = body.get("event_id")
+        if event_id is not None:
+            event_id = str(event_id)
+        with self.repo.tx() as conn:
+            alloc = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
+            if not alloc:
+                raise ApiError(404, "allocation_not_found", "分配不存在")
+            if role == "hospital":
+                donor = conn.execute("SELECT hospital FROM donors WHERE id=?", (alloc["donor_id"],)).fetchone()
+                candidate = conn.execute("SELECT hospital FROM candidates WHERE id=?", (alloc["candidate_id"],)).fetchone()
+                if hospital not in {donor["hospital"], candidate["hospital"]}:
+                    raise ApiError(403, "allocation_forbidden", "医院只能提交本机构相关分配的事件")
+            return self._record_event(conn, allocation_id, action, actor, role, hospital,
+                                      body.get("detail") or {}, submitted_at, event_id)
+
+    def timeline(self, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
+        """返回分配时间线；医院只看到本机构的分配，历史分配无时间线时按现状补初始记录。"""
+        with self.repo.tx() as conn:
+            alloc = conn.execute("""SELECT a.*, d.hospital donor_hospital, c.hospital candidate_hospital
+                                   FROM allocations a JOIN donors d ON d.id=a.donor_id JOIN candidates c ON c.id=a.candidate_id
+                                   WHERE a.id=?""", (allocation_id,)).fetchone()
+            if not alloc:
+                raise ApiError(404, "allocation_not_found", "分配不存在")
+            if role == "hospital" and hospital not in {alloc["donor_hospital"], alloc["candidate_hospital"]}:
+                raise ApiError(403, "allocation_forbidden", "医院不能查看与本机构无关的分配")
+            events = [dict(r) for r in conn.execute(
+                "SELECT * FROM timeline_events WHERE allocation_id=? ORDER BY submitted_at, id", (allocation_id,))]
+            if not events:
+                # 历史分配没有时间线：按现有状态补一条初始记录
+                action = STATUS_TO_ACTION.get(alloc["status"], "allocation_proposed")
+                self._record_event(conn, allocation_id, action, "system", "system", "",
+                                   {"backfilled": True, "from_status": alloc["status"]}, alloc["updated_at"])
+                events = [dict(r) for r in conn.execute(
+                    "SELECT * FROM timeline_events WHERE allocation_id=? ORDER BY submitted_at, id", (allocation_id,))]
+            return {"allocation_id": allocation_id, "events": events}
 
     def register_donor(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"coordinator", "allocation_officer"}: raise ApiError(403, "donor_forbidden", "当前角色不能登记器官")
@@ -174,6 +343,7 @@ class OrganAllocationService:
             allocation_id = cur.lastrowid
             conn.execute("UPDATE donors SET status='allocated',revision=revision+1 WHERE id=?", (donor_id,))
             Repository.audit(conn, allocation_id, donor_id, actor, role, "allocation_proposed", {"candidate_id": candidate_id, "score": score})
+            self._record_event(conn, allocation_id, "allocation_proposed", actor, role, "", {"candidate_id": candidate_id, "score": score["total"]})
             return self._allocation(conn, allocation_id, role, "")
 
     def _allocation(self, conn: sqlite3.Connection, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
@@ -214,6 +384,7 @@ class OrganAllocationService:
             if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配信息已发生变化")
             conn.execute("UPDATE allocations SET status='accepted',accepted_at=?,revision=revision+1,updated_at=? WHERE id=?", (iso(), iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_accepted", {"hospital": hospital})
+            self._record_event(conn, allocation_id, "allocation_accepted", actor, role, hospital, {"hospital": hospital})
             return self._allocation(conn, allocation_id, role, hospital)
 
     def mark_transit(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -226,6 +397,7 @@ class OrganAllocationService:
             if row["status"] != "accepted": raise ApiError(409, "invalid_transition", "只有已接受分配可以进入转运")
             conn.execute("UPDATE allocations SET status='in_transit',cold_chain_temp=?,revision=revision+1,updated_at=? WHERE id=?", (float(temp), iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "transfer_started", {"cold_chain_temp": temp})
+            self._record_event(conn, allocation_id, "transfer_started", actor, role, "", {"cold_chain_temp": temp})
             return self._allocation(conn, allocation_id, role, "")
 
     def report_delay(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -236,6 +408,7 @@ class OrganAllocationService:
             row = self._ensure_active(conn, allocation_id, actor, role)
             conn.execute("UPDATE allocations SET delayed_minutes=delayed_minutes+?,revision=revision+1,updated_at=? WHERE id=?", (minutes, iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "logistics_delay", {"minutes": minutes, "reason": reason, "at_risk": minutes >= 120})
+            self._record_event(conn, allocation_id, "logistics_delay", actor, role, "", {"minutes": minutes, "reason": reason, "at_risk": minutes >= 120})
             return self._allocation(conn, allocation_id, role, "")
 
     def initiate_handoff(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -257,6 +430,7 @@ class OrganAllocationService:
             except sqlite3.IntegrityError as exc:
                 raise ApiError(409, "handoff_exists", "交接已经登记") from exc
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_initiated", {"target": target, "cold_chain_temp": temp})
+            self._record_event(conn, allocation_id, "handoff_initiated", actor, role, hospital, {"target": target, "cold_chain_temp": temp})
             return {"handoff": dict(conn.execute("SELECT * FROM handoffs WHERE id=?", (cur.lastrowid,)).fetchone()), "allocation": self._allocation(conn, allocation_id, role, hospital)}
 
     def accept_handoff(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -270,6 +444,7 @@ class OrganAllocationService:
             conn.execute("UPDATE handoffs SET status='accepted',accepted_by=?,accepted_at=? WHERE id=?", (actor, iso(), handoff["id"]))
             conn.execute("UPDATE allocations SET status='handed_off',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_accepted", {"handoff_id": handoff["id"]})
+            self._record_event(conn, allocation_id, "handoff_accepted", actor, role, hospital, {"handoff_id": handoff["id"]})
             return self._allocation(conn, allocation_id, role, hospital)
 
     def implant(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -280,6 +455,7 @@ class OrganAllocationService:
             conn.execute("UPDATE allocations SET status='implanted',implanted_at=?,revision=revision+1,updated_at=? WHERE id=?", (iso(), iso(), allocation_id))
             conn.execute("UPDATE donors SET status='used',revision=revision+1 WHERE id=?", (row["donor_id"],))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "organ_implanted", {"candidate_id": row["candidate_id"]})
+            self._record_event(conn, allocation_id, "organ_implanted", actor, role, "", {"candidate_id": row["candidate_id"]})
             return self._allocation(conn, allocation_id, role, "")
 
     def withdraw(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -296,6 +472,7 @@ class OrganAllocationService:
             donor_status = "available" if parse_time(donor["expires_at"]) > utcnow() else "expired"
             conn.execute("UPDATE donors SET status=?,revision=revision+1 WHERE id=?", (donor_status, row["donor_id"]))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_withdrawn", {"reason": reason})
+            self._record_event(conn, allocation_id, "allocation_withdrawn", actor, role, hospital, {"reason": reason})
             return self._allocation(conn, allocation_id, role, hospital)
 
     def get_allocation(self, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
@@ -344,6 +521,7 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.audit(int(parts[2]), role)}
+        if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "timeline": return 200, self.service.timeline(int(parts[2]), role, hospital)
         raise ApiError(404, "not_found", "接口不存在")
     def dispatch_post(self, path: str) -> tuple[int, Any]:
         actor, role, hospital = self.service.identity(self.headers); body = self.read_body(); parts = [p for p in path.split("/") if p]
@@ -355,6 +533,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in actions: return actions[path]()
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit():
             aid, action = int(parts[2]), parts[3]
+            if action == "events": return 200, self.service.submit_event(aid, actor, role, hospital, body)
             routes = {
                 "accept": lambda: self.service.accept(aid, actor, role, hospital, body),
                 "withdraw": lambda: self.service.withdraw(aid, actor, role, hospital, body),

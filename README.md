@@ -21,7 +21,16 @@ python3 app.py --db organ_allocation.db
 - `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报。
 - `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认。
 - `POST /api/allocations/{id}/implant`：确认植入。
+- `POST /api/allocations/{id}/events`：三方（来源医院、接收医院、调配员）提交转运事件，接入分配时间线对账。
+- `GET /api/allocations/{id}/timeline`：分配时间线对账；医院只看到本机构的分配。
 - `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图。
+
+## 时间线对账
+
+- 同一个动作晚到或重复提交只补一次记录（幂等），不新增条目；已完成步骤不退回。
+- 两个机构同时提交矛盾的完成（交接/植入）与撤回时，按提交时刻取最后生效的一步，被压掉的记录标为 `conflict`。
+- 已完成交接/植入后才提交的撤回属于晚到，标 `conflict`，不退回已完成步骤。
+- 每条时间线记录都包含动作、提交人和所属机构；历史分配没有时间线时，按现有状态补一条初始记录。
 
 ## 测试
 
